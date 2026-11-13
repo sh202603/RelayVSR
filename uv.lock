@@ -734,7 +734,7 @@ wheels = [
 [[package]]
 name = "refvsr-inference"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "accelerate", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-16-refvsr-inference-cpu' and extra == 'extra-16-refvsr-inference-cu128')" },
     { name = "av", marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-16-refvsr-inference-cpu' and extra == 'extra-16-refvsr-inference-cu128')" },

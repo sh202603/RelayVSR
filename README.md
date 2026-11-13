@@ -72,13 +72,16 @@ uvx hf download kopper/RelayVSR flash.safetensors wan.safetensors --local-dir we
 ```
 
 The expected paths are `weights/wan.safetensors` and
-`weights/flash.safetensors`, resolved relative to `inference.py`.
+`weights/flash.safetensors`, resolved relative to the repository root.
 The bundled `assets/demo/input.mp4` is used when `--input` is omitted.
 
 ```bash
-python inference.py \
-  --output output_x4.mp4
+relayvsr --output output_x4.mp4
 ```
+
+`uv sync` installs the `relayvsr` command into the environment, and it works
+from any directory while the environment is active. `python inference.py` in
+the repository root is equivalent.
 
 Pass `--input path/to/video.mp4` to process another video, or provide an
 ordered image directory together with `--fps`.

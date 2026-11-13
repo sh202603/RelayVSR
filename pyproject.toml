@@ -13,12 +13,21 @@ dependencies = [
   "av>=17,<19", "safetensors>=0.6", "numpy>=1.26", "pillow>=10",
 ]
 
+[project.scripts]
+relayvsr = "refvsr_inference.cli:main"
+
 [project.optional-dependencies]
 cpu = ["torch==2.10.0"]
 cu128 = ["torch==2.10.0"]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["refvsr_inference"]
+
 [tool.uv]
-package = false
 conflicts = [[{ extra = "cpu" }, { extra = "cu128" }]]
 environments = ["sys_platform == 'linux'", "sys_platform == 'win32'"]
 
