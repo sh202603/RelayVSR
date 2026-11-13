@@ -154,6 +154,8 @@ class WanVSRPipeline:
     def create_streaming_state(
         self,
         model: torch.nn.Module,
+        kv_cache_device: str = "gpu",
+        kv_cache_dtype: str = "native",
     ) -> WanVSRStreamingState:
         """Create one bounded Wan state per configured sampling timestep."""
         if self.sampling.execution_mode != "streaming":
@@ -169,6 +171,8 @@ class WanVSRPipeline:
             model_state=model.create_streaming_state(
                 kv_cache_window_size=self.sampling.kv_cache_window_size,
                 conditioning_cache=self._streaming_conditioning_cache,
+                kv_cache_device=kv_cache_device,
+                kv_cache_dtype=kv_cache_dtype,
             )
         )
 

@@ -16,3 +16,4 @@ outputs/
 !assets/demo/input.mp4
 !assets/demo/relayvsr-comparison.mp4
 *.frames.jsonl
+CLAUDE.md

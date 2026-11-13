@@ -73,8 +73,10 @@ def iter_frames(path, *, max_frames=None, start_frame=0):
 
 
 class VideoWriter:
-    def __init__(self, path, fps):
-        self.path, self.fps = Path(path), fps
+    def __init__(self, path, fps, threads=1):
+        if threads < 0:
+            raise ValueError("Encoder threads must be 0 (automatic) or positive.")
+        self.path, self.fps, self.threads = Path(path), fps, threads
         self.container = self.stream = None
         self.frames = 0
 
@@ -98,7 +100,7 @@ class VideoWriter:
             self.stream.height, self.stream.width = h, w
             self.stream.pix_fmt = "yuv420p" if h % 2 == w % 2 == 0 else "yuv444p"
             self.stream.options = {"crf": "18", "preset": "fast"}
-            self.stream.codec_context.thread_count = 1
+            self.stream.codec_context.thread_count = self.threads
         if (h, w) != (self.stream.height, self.stream.width):
             raise ValueError("Output dimensions changed.")
         for packet in self.stream.encode(av.VideoFrame.from_ndarray(rgb, format="rgb24")):
@@ -119,3 +121,118 @@ class VideoWriter:
             if self.container is not None:
                 self.container.close()
             self.temporary.unlink(missing_ok=True)
+
+
+def _audio_stream(container):
+    return next(iter(container.streams.audio), None)
+
+
+def has_audio(path) -> bool:
+    path = Path(path)
+    if path.is_dir() or path.suffix.lower() in IMAGE_SUFFIXES:
+        return False
+    with av.open(str(path)) as container:
+        return _audio_stream(container) is not None
+
+
+def _video_packets(parts, stream, frame_ticks):
+    """Yield (seconds, packet) for the parts played back to back."""
+    offset = 0
+    for part in parts:
+        with av.open(str(part)) as container:
+            source = container.streams.video[0]
+            frames = 0
+            for packet in container.demux(source):
+                if packet.dts is None:
+                    continue
+                frames += 1
+                packet.pts += offset
+                packet.dts += offset
+                packet.stream = stream
+                yield float(packet.dts * stream.time_base), packet
+        offset += frames * frame_ticks
+
+
+def _audio_packets(container, source, stream, start, duration):
+    """Yield (seconds, packet) for the audio inside [start, start + duration)."""
+    # From the very start, keep the timestamps as they are: the encoder priming
+    # packet sits before zero and must stay there.
+    first = int(start / source.time_base) + (source.start_time or 0) if start > 0 else 0
+    last = first + int(duration / source.time_base)
+    if start > 0:
+        container.seek(first, stream=source, backward=True)
+    for packet in container.demux(source):
+        if packet.dts is None or packet.pts is None:
+            continue
+        if start > 0 and packet.pts < first:
+            continue
+        if packet.pts >= last:
+            break
+        packet.pts -= first
+        packet.dts = packet.pts
+        packet.stream = stream
+        yield float(packet.pts * stream.time_base), packet
+
+
+def publish_video(parts, output, fps, *, audio_from=None, audio_start=0.0):
+    """Join encoded parts into ``output`` atomically, optionally with the source audio.
+
+    Nothing is re-encoded: video packets are concatenated and audio packets are
+    copied for the time range the video covers. Returns whether audio was written;
+    audio that the MP4 container cannot carry is dropped with a warning.
+    """
+    import heapq
+    import warnings
+
+    output = Path(output)
+    parts = [Path(part) for part in parts]
+    if not parts:
+        raise ValueError("Cannot publish an empty video.")
+    handle = tempfile.NamedTemporaryFile(
+        prefix=".refvsr-", suffix=".mp4", dir=output.parent, delete=False
+    )
+    temporary = Path(handle.name)
+    handle.close()
+
+    def write(with_audio):
+        with av.open(str(parts[0])) as probe, av.open(str(temporary), "w", format="mp4") as out:
+            template = probe.streams.video[0]
+            video = out.add_stream_from_template(template)
+            video.time_base = template.time_base
+            frame_ticks = int(1 / (Fraction(fps) * template.time_base))
+            streams = [_video_packets(parts, video, frame_ticks)]
+            source = None
+            if with_audio:
+                source = av.open(str(audio_from))
+            try:
+                frames = 0
+                if source is not None:
+                    for part in parts:
+                        with av.open(str(part)) as container:
+                            frames += container.streams.video[0].frames
+                    audio_in = _audio_stream(source)
+                    audio = out.add_stream_from_template(audio_in)
+                    audio.time_base = audio_in.time_base
+                    streams.append(
+                        _audio_packets(source, audio_in, audio, audio_start, frames / Fraction(fps))
+                    )
+                for _, packet in heapq.merge(*streams, key=lambda item: item[0]):
+                    out.mux(packet)
+            finally:
+                if source is not None:
+                    source.close()
+
+    try:
+        wrote_audio = audio_from is not None and has_audio(audio_from)
+        if wrote_audio:
+            try:
+                write(True)
+            except (av.FFmpegError, ValueError) as error:
+                warnings.warn(f"Audio was not copied ({error}).", stacklevel=2)
+                wrote_audio = False
+        if not wrote_audio:
+            write(False)
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return wrote_audio
