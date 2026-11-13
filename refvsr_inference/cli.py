@@ -8,9 +8,17 @@ from pathlib import Path
 import torch
 
 from refvsr_inference.checkpoints import load_checkpoints
-from refvsr_inference.media import VideoWriter, has_audio, input_fps, iter_frames, publish_video
+from refvsr_inference.media import (
+    VideoWriter,
+    frame_count,
+    has_audio,
+    input_fps,
+    iter_frames,
+    publish_video,
+)
 from refvsr_inference.models.wan.fp8 import convert_wan_fp8, release_cross_attention_kv
 from refvsr_inference.models.wan.sampling import WanVSRPipeline
+from refvsr_inference.runtime.progress import Progress
 from refvsr_inference.runtime.resume import SegmentStore, file_fingerprint
 from refvsr_inference.runtime.streaming import CollaborativeFrameStream, InputFrame
 
@@ -176,7 +184,14 @@ def run(args):
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     stage_ms, stage_calls = {}, {}
+    # Frames of the whole run, counting the ones an earlier run already finished.
+    expected = frame_count(args.input)
+    if expected is not None:
+        expected = max(0, expected - args.start_frame)
+        if args.max_frames is not None:
+            expected = min(expected, args.max_frames)
     started = time.perf_counter()
+    progress = Progress(expected or None, done)
     writer, new_frames = None, 0
     try:
         for result in stream.frames(packets, resume=checkpoint):
@@ -190,6 +205,7 @@ def run(args):
             rgb = result.rgb[0].add(1).mul_(127.5).clamp_(0, 255).to(torch.uint8)
             writer.write(rgb.permute(1, 2, 0).contiguous().cpu())
             new_frames += 1
+            progress.update()
             # The frame is already on the CPU, so resolving its spans cannot stall the stream.
             for name, span in result.timings:
                 stage_ms[name] = stage_ms.get(name, 0.0) + span.milliseconds()
@@ -213,6 +229,7 @@ def run(args):
             writer.__exit__(*sys.exc_info())
         raise
     finally:
+        progress.close()
         packets.close()
         frames.close()
     audio_from = None if args.no_audio or not has_audio(args.input) else args.input
@@ -228,6 +245,7 @@ def run(args):
         copied_audio = publish_video(
             [args.output], args.output, fps, audio_from=audio_from, audio_start=audio_start
         )
+    processing = progress.last_draw - progress.started
     elapsed = time.perf_counter() - started
     total = done + new_frames
     print(f"Saved {total} frames to {args.output} ({elapsed:.2f}s)")
@@ -236,7 +254,11 @@ def run(args):
         f"Wan weights: {wan_weights}; "
         f"K/V cache: {stream.resolved_wan_kv_cache}, {args.kv_cache_dtype}"
     )
-    print(f"Throughput: {new_frames / elapsed:.2f} fps including decode, encode and warm-up")
+    print(
+        f"Throughput: {new_frames / processing:.2f} fps for {new_frames} frames in "
+        f"{processing:.2f}s (decode, inference, encode and warm-up); "
+        f"{new_frames / elapsed:.2f} fps including the final mux"
+    )
     for name, total_ms in stage_ms.items():
         calls = stage_calls[name]
         print(
