@@ -65,7 +65,13 @@ class CollaborativeFrameStream:
         seed=42,
         reuse_endpoint_kv=True,
         precompute_rope=True,
+        wan_kv_cache="gpu",
+        wan_kv_cache_dtype="native",
     ):
+        if wan_kv_cache not in ("gpu", "cpu", "auto"):
+            raise ValueError("wan_kv_cache must be gpu, cpu or auto.")
+        if wan_kv_cache_dtype not in ("native", "int8"):
+            raise ValueError("wan_kv_cache_dtype must be native or int8.")
         if window_size < 2:
             raise ValueError("Collaborative window_size must be at least 2.")
         if flash_model.condition_mode != "endpoints":
@@ -82,6 +88,9 @@ class CollaborativeFrameStream:
         self.seed = seed
         self.reuse_endpoint_kv = reuse_endpoint_kv
         self.precompute_rope = precompute_rope
+        self.wan_kv_cache = wan_kv_cache
+        self.wan_kv_cache_dtype = wan_kv_cache_dtype
+        self.resolved_wan_kv_cache = None
         self.last_keyframe_indices: deque[int] = deque(maxlen=10000)
         self.keyframe_count = 0
         self.capture_state = False
@@ -101,21 +110,87 @@ class CollaborativeFrameStream:
             self.flash.prepare_streaming(geometry[0], geometry[1], self.window_size)
             self._prepared_geometry = geometry
 
+    def wan_kv_cache_bytes(self, padded_height, padded_width):
+        """Size of the Wan self-attention K/V rings for one native LR geometry."""
+        config = self.wan.config
+        _, patch_h, patch_w = (int(v) for v in config.patch_size)
+        # Wan sees the 4x frame through a 16x latent grid, i.e. LR / 4 per latent.
+        tokens = (padded_height // (4 * patch_h)) * (padded_width // (4 * patch_w))
+        window = self.wan.temporal_context_frames
+        window = 4 if window == -1 else window
+        dim = int(config.num_attention_heads) * int(config.attention_head_dim)
+        item = torch.empty((), dtype=self.dtype).element_size()
+        layer = 2 * window * tokens * dim * item
+        if self.wan_kv_cache_dtype == "int8":
+            # int8 codes for every layer, plus the one shared window in the compute dtype.
+            return len(self.wan.blocks) * 2 * window * tokens * dim + layer
+        return len(self.wan.blocks) * layer
+
+    def resolve_wan_kv_cache(self, padded_height, padded_width):
+        """Pick the K/V location; ``auto`` keeps it on the GPU only when it fits."""
+        if self.wan_kv_cache != "auto":
+            return self.wan_kv_cache
+        if self.device.type != "cuda":
+            return "gpu"
+        free, _ = torch.cuda.mem_get_info(self.device)
+        free += torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
+        # Headroom for Wan activations and the Flash decoder, which grows with the output.
+        headroom = 2**30 + 320 * (4 * padded_height) * (4 * padded_width)
+        needed = self.wan_kv_cache_bytes(padded_height, padded_width)
+        return "gpu" if needed + headroom <= free else "cpu"
+
+    def checkpoint(self) -> dict:
+        """State needed to continue after the frame at the current window end.
+
+        Valid once the frame whose index equals its ``window_end`` has been
+        yielded and until the generator is advanced again. Continuing needs
+        only the Wan rings, the endpoint latent and the noise generator: Flash
+        restarts its history at every window.
+        """
+        point = getattr(self, "_checkpoint_source", None)
+        if point is None:
+            raise RuntimeError("No window is in progress.")
+        index, latent, wan_state, generator = point
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return {
+            "format": "refvsr-stream-v1",
+            "frame": index,
+            "keyframe_count": self.keyframe_count,
+            "latent": latent.cpu(),
+            "generator": None if generator is None else generator[0].get_state().cpu(),
+            "wan": wan_state.model_state.export(),
+        }
+
     @torch.no_grad()
-    def frames(self, source: Iterable[InputFrame]) -> Iterator[OutputFrame]:
+    def frames(
+        self, source: Iterable[InputFrame], *, resume: dict | None = None
+    ) -> Iterator[OutputFrame]:
+        """Yield super-resolved frames in order.
+
+        With ``resume`` (from :meth:`checkpoint`), ``source`` must start at the
+        checkpointed frame; that frame is consumed again but not yielded again.
+        """
         iterator = iter(source)
         first = next(iterator, None)
         if first is None:
             raise ValueError("Cannot infer an empty stream.")
-        if first.index != 0:
-            raise ValueError("A new stream must start at frame 0.")
+        if resume is not None and resume.get("format") != "refvsr-stream-v1":
+            raise ValueError("Unknown stream checkpoint.")
+        if first.index != (0 if resume is None else resume["frame"]):
+            raise ValueError("The stream must start at frame 0 or at the checkpointed frame.")
         shape = tuple(first.rgb.shape)
         h, w = shape[-2:]
         patch = self.wan.config.patch_size
         stride = 16 * max(int(patch[1]), int(patch[2])) // 4
         ph, pw = h + (-h) % stride, w + (-w) % stride
         self.prepare(h, w)
-        wan_state = self.pipeline.create_streaming_state(self.wan)
+        self.resolved_wan_kv_cache = self.resolve_wan_kv_cache(ph, pw)
+        wan_state = self.pipeline.create_streaming_state(
+            self.wan,
+            kv_cache_device=self.resolved_wan_kv_cache,
+            kv_cache_dtype=self.wan_kv_cache_dtype,
+        )
         generator = (
             None
             if self.seed is None
@@ -152,10 +227,20 @@ class CollaborativeFrameStream:
             pending_timings.append(("flash_condition", span.finish()))
             return latent, prepared
 
-        # First condition can be computed while the producer collects lookahead.
-        start_latent, start_prepared = keyframe(first)
+        if resume is None:
+            # First condition can be computed while the producer collects lookahead.
+            start_latent, start_prepared = keyframe(first)
+        else:
+            wan_state.model_state.restore(resume["wan"], device=self.device, dtype=self.dtype)
+            if generator is not None:
+                generator[0].set_state(resume["generator"])
+            self.keyframe_count = int(resume["keyframe_count"])
+            start_latent = resume["latent"].to(device=self.device, dtype=self.dtype)
+            start_prepared = (
+                self.flash.prepare_condition(start_latent) if self.reuse_endpoint_kv else None
+            )
         start = first
-        first_window = True
+        first_window = resume is None
         while True:
             window = [start, *islice(iterator, self.window_size - 1)]
             for offset, packet in enumerate(window):
@@ -170,6 +255,7 @@ class CollaborativeFrameStream:
                 end_latent, end_prepared = start_latent, start_prepared
             else:
                 end_latent, end_prepared = keyframe(end)
+            self._checkpoint_source = (end.index, end_latent, wan_state, generator)
             count = max(2, len(window))
             span = DeviceSpan(self.device)
             state = (

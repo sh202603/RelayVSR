@@ -59,14 +59,60 @@ _compiled_flex_attention = None
 
 
 @dataclass
+class WanKVScratch:
+    """One GPU K/V window shared by every layer whose ring is not directly usable.
+
+    A layer only needs its window during its own attention call, so a single
+    buffer serves all layers in turn.
+    """
+
+    key_value: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def get(self, shape, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        current = self.key_value
+        if (
+            current is None
+            or current[0].shape != shape
+            or current[0].device != like.device
+            or current[0].dtype != like.dtype
+        ):
+            self.key_value = current = like.new_empty(shape), like.new_empty(shape)
+        return current
+
+
+def _empty_store(shape, dtype, device, on_host: bool) -> torch.Tensor:
+    if not on_host:
+        return torch.empty(shape, dtype=dtype, device=device)
+    try:
+        return torch.empty(shape, dtype=dtype, pin_memory=True)
+    except RuntimeError:
+        # Pinning can fail when the OS refuses to lock that much memory.
+        return torch.empty(shape, dtype=dtype)
+
+
+@dataclass
 class WanSelfAttentionKVCache:
-    """Fixed-capacity ring containing normalized, entirely unrotated K and V."""
+    """Fixed-capacity ring containing normalized, entirely unrotated K and V.
+
+    The default keeps the ring on the GPU in the compute dtype. With ``scratch``
+    set, the ring is stored elsewhere and rebuilt into the shared GPU window for
+    each attention call:
+
+    * ``on_host`` keeps it in (pinned) host memory. Without quantization the
+      values are copied unchanged, so the attention inputs are identical.
+    * ``quantized`` stores int8 codes with one scale per token and head. Earlier
+      frames are then approximate; the frame being generated stays exact.
+    """
 
     window_size: int = 4
     key_value: tuple[torch.Tensor, torch.Tensor] | None = None
     tokens_per_frame: int | None = None
     next_frame: int = 0
-    _storage: tuple[torch.Tensor, torch.Tensor] | None = None
+    scratch: WanKVScratch | None = None
+    on_host: bool = False
+    quantized: bool = False
+    _storage: tuple | None = None
+    _signature: tuple | None = None
 
     def update(
         self, key: torch.Tensor, value: torch.Tensor, frame_index: int
@@ -76,26 +122,128 @@ class WanSelfAttentionKVCache:
         if key.shape != value.shape:
             raise ValueError("Streaming K/V shapes must match.")
         b, tokens, heads, dim = key.shape
+        shape = (b, self.window_size * tokens, heads, dim)
+        if self.scratch is None and (self.on_host or self.quantized):
+            raise ValueError("Host or quantized K/V storage requires a scratch window.")
         if self._storage is None:
             self.tokens_per_frame = tokens
-            shape = (b, self.window_size * tokens, heads, dim)
-            self._storage = key.new_empty(shape), value.new_empty(shape)
-        cached_key, cached_value = self._storage
-        if (
-            self.tokens_per_frame != tokens
-            or cached_key.shape[0] != b
-            or cached_key.shape[2:] != key.shape[2:]
-            or cached_key.device != key.device
-            or cached_key.dtype != key.dtype
-        ):
-            raise ValueError("Streaming KV cache shape, device and dtype must remain constant.")
+            if self.scratch is None:
+                self._storage = key.new_empty(shape), value.new_empty(shape)
+            else:
+                data_dtype = torch.int8 if self.quantized else key.dtype
+                self._storage = tuple(
+                    (
+                        _empty_store(shape, data_dtype, key.device, self.on_host),
+                        _empty_store(shape[:3] + (1,), key.dtype, key.device, self.on_host)
+                        if self.quantized
+                        else None,
+                    )
+                    for _ in range(2)
+                )
+                self._signature = (b, heads, dim, key.dtype, key.device)
         start = (frame_index % self.window_size) * tokens
-        cached_key[:, start : start + tokens].copy_(key.detach())
-        cached_value[:, start : start + tokens].copy_(value.detach())
+        stop = start + tokens
         valid_tokens = min(frame_index + 1, self.window_size) * tokens
-        self.key_value = cached_key[:, :valid_tokens], cached_value[:, :valid_tokens]
+        if self.scratch is None:
+            cached_key, cached_value = self._storage
+            if (
+                self.tokens_per_frame != tokens
+                or cached_key.shape[0] != b
+                or cached_key.shape[2:] != key.shape[2:]
+                or cached_key.device != key.device
+                or cached_key.dtype != key.dtype
+            ):
+                raise ValueError(
+                    "Streaming KV cache shape, device and dtype must remain constant."
+                )
+            cached_key[:, start:stop].copy_(key.detach())
+            cached_value[:, start:stop].copy_(value.detach())
+            self.key_value = cached_key[:, :valid_tokens], cached_value[:, :valid_tokens]
+            self.next_frame += 1
+            return self.key_value
+        signature = (b, heads, dim, key.dtype, key.device)
+        if self._signature is None:
+            self._signature = signature  # first update after a restore
+        if self.tokens_per_frame != tokens or self._signature != signature:
+            raise ValueError("Streaming KV cache shape, device and dtype must remain constant.")
         self.next_frame += 1
-        return self.key_value
+        window = self.scratch.get(shape, key)
+        for (data, scale), target, new in zip(self._storage, window, (key, value)):
+            new = new.detach()
+            # Earlier frames come from the store; the new frame is already on the GPU.
+            for first, last in ((0, start), (stop, valid_tokens)):
+                if first >= last:
+                    continue
+                if scale is None:
+                    target[:, first:last].copy_(data[:, first:last], non_blocking=True)
+                    continue
+                # Move the int8 codes first: converting on the host would double the transfer.
+                codes = data[:, first:last].to(new.device, non_blocking=True)
+                target[:, first:last].copy_(codes)
+                target[:, first:last].mul_(scale[:, first:last].to(new.device, non_blocking=True))
+            target[:, start:stop].copy_(new)
+            if scale is None:
+                data[:, start:stop].copy_(new, non_blocking=True)
+                continue
+            step = new.abs().amax(-1, keepdim=True).float().div_(127).clamp_min_(1e-12)
+            # Quantize against the scale as stored, so that decoding inverts it exactly.
+            step = step.to(new.dtype)
+            codes = new.float().div_(step.float()).round_().clamp_(-127, 127).to(torch.int8)
+            data[:, start:stop].copy_(codes, non_blocking=True)
+            scale[:, start:stop].copy_(step, non_blocking=True)
+        # The scratch is reused by the next layer, so no reference is retained here.
+        return window[0][:, :valid_tokens], window[1][:, :valid_tokens]
+
+    def export(self) -> dict:
+        """Host copies of the ring, independent of where it is stored.
+
+        The caller must synchronize the device first: host stores are written
+        by non-blocking copies.
+        """
+        if self._storage is None:
+            raise RuntimeError("Cannot export an empty KV cache.")
+        if self.scratch is None:
+            tensors = dict(zip(("key", "value"), self._storage))
+        else:
+            (key, key_scale), (value, value_scale) = self._storage
+            tensors = {"key": key, "value": value}
+            if self.quantized:
+                tensors.update(key_scale=key_scale, value_scale=value_scale)
+        return {
+            "next_frame": self.next_frame,
+            "tensors": {name: tensor.cpu() for name, tensor in tensors.items()},
+        }
+
+    def restore(self, payload: dict, *, device, dtype) -> None:
+        """Load an export made with the same quantization; the location may differ."""
+        tensors = payload["tensors"]
+        if ("key_scale" in tensors) != self.quantized:
+            raise ValueError("KV checkpoint and cache disagree on quantization.")
+        expected = torch.int8 if self.quantized else dtype
+        if tensors["key"].dtype != expected or tensors["value"].dtype != expected:
+            raise ValueError("KV checkpoint dtype does not match this cache.")
+        b, total, heads, dim = tensors["key"].shape
+        if total % self.window_size:
+            raise ValueError("KV checkpoint does not match the cache window.")
+        device = torch.device(device)
+        self.tokens_per_frame = total // self.window_size
+        self.next_frame = int(payload["next_frame"])
+        if self.scratch is None:
+            self._storage = tensors["key"].to(device), tensors["value"].to(device)
+            valid = min(self.next_frame, self.window_size) * self.tokens_per_frame
+            self.key_value = self._storage[0][:, :valid], self._storage[1][:, :valid]
+            return
+
+        def store(tensor):
+            if tensor is None:
+                return None
+            target = _empty_store(tensor.shape, tensor.dtype, device, self.on_host)
+            return target.copy_(tensor)
+
+        self._storage = tuple(
+            (store(tensors[name]), store(tensors.get(f"{name}_scale"))) for name in ("key", "value")
+        )
+        self._signature = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +278,19 @@ class WanStreamingState:
     conditioning_cache: WanConditioningCache | None = None
     frame_index: int = 0
     grid_signature: tuple | None = None
+
+    def export(self) -> dict:
+        return {
+            "frame_index": self.frame_index,
+            "blocks": [cache.export() for cache in self.block_caches],
+        }
+
+    def restore(self, payload: dict, *, device, dtype) -> None:
+        if len(payload["blocks"]) != len(self.block_caches):
+            raise ValueError("KV checkpoint does not match the model depth.")
+        for cache, block in zip(self.block_caches, payload["blocks"]):
+            cache.restore(block, device=device, dtype=dtype)
+        self.frame_index = int(payload["frame_index"])
 
 
 def _apply_wan_rotary(hidden_states, rotary_emb):
@@ -1112,8 +1273,18 @@ class WanTransformer3DModel(
         *,
         kv_cache_window_size: int = -1,
         conditioning_cache: WanConditioningCache | None = None,
+        kv_cache_device: str = "gpu",
+        kv_cache_dtype: str = "native",
     ) -> WanStreamingState:
-        """Create an empty KV cache for one timestep and video batch."""
+        """Create an empty KV cache for one timestep and video batch.
+
+        ``kv_cache_device="cpu"`` keeps every layer's ring in host memory and
+        ``kv_cache_dtype="int8"`` stores it quantized; see WanSelfAttentionKVCache.
+        """
+        if kv_cache_device not in ("gpu", "cpu"):
+            raise ValueError("kv_cache_device must be gpu or cpu.")
+        if kv_cache_dtype not in ("native", "int8"):
+            raise ValueError("kv_cache_dtype must be native or int8.")
         if not self.config.use_block_causal_attention:
             raise ValueError("Streaming inference requires use_block_causal_attention=True.")
         if int(self.config.num_frames_per_block) != 1:
@@ -1134,8 +1305,15 @@ class WanTransformer3DModel(
             raise ValueError(
                 "Streaming requires 1 <= temporal_context_frames <= training_frames <= rope_max_seq_len."
             )
+        on_host, quantized = kv_cache_device == "cpu", kv_cache_dtype == "int8"
+        scratch = WanKVScratch() if on_host or quantized else None
         return WanStreamingState(
-            block_caches=[WanSelfAttentionKVCache(window_size=window) for _ in self.blocks],
+            block_caches=[
+                WanSelfAttentionKVCache(
+                    window_size=window, scratch=scratch, on_host=on_host, quantized=quantized
+                )
+                for _ in self.blocks
+            ],
             conditioning_cache=conditioning_cache,
         )
 
