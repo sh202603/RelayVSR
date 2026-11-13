@@ -36,6 +36,30 @@ def input_fps(path, override=None):
     return fps
 
 
+def frame_count(path):
+    """Return the number of input frames, or None when the container does not tell.
+
+    Nothing is decoded: for a video this is the container's count, or else its
+    duration times the frame rate, so it can be slightly off.
+    """
+    path = Path(path)
+    if path.is_dir():
+        return sum(1 for p in path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+    if path.suffix.lower() in IMAGE_SUFFIXES:
+        return 1
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        if stream.frames:
+            return stream.frames
+        rate = stream.average_rate
+        if rate:
+            if stream.duration is not None and stream.time_base is not None:
+                return round(stream.duration * stream.time_base * rate) or None
+            if container.duration is not None:
+                return round(Fraction(container.duration, av.time_base) * rate) or None
+    return None
+
+
 def iter_frames(path, *, max_frames=None, start_frame=0):
     path = Path(path)
     if not path.exists():
