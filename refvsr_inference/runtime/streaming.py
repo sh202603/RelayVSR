@@ -80,6 +80,12 @@ class CollaborativeFrameStream:
             raise ValueError("Streaming models must be in eval() mode.")
         self.wan = wan_model
         self.flash = flash_model
+        # Output pixels per input pixel: 4, or 2 with the 2x checkpoints.
+        self.scale = int(flash_model.upscale_factor)
+        # Native pixels per Wan latent; the latent grid is 1/16 of the output.
+        self.latent_stride = 16 // self.scale
+        # The 4x Wan reads a 4x bilinear upsample of the frame, the 2x Wan the frame itself.
+        self.wan_input_scale = 4 if self.scale == 4 else 1
         self.pipeline = wan_pipeline
         self.prompt = prompt_embeds
         self.device = torch.device(device)
@@ -95,10 +101,15 @@ class CollaborativeFrameStream:
         self.keyframe_count = 0
         self.capture_state = False
 
+    @property
+    def stride(self):
+        """Native pixels per Wan token; frames are padded to a multiple of it."""
+        patch = self.wan.config.patch_size
+        return self.latent_stride * max(int(patch[1]), int(patch[2]))
+
     @torch.no_grad()
     def prepare(self, height, width):
-        patch = self.wan.config.patch_size
-        stride = 16 * max(int(patch[1]), int(patch[2])) // 4
+        stride = self.stride
         geometry = (
             height + (-height) % stride,
             width + (-width) % stride,
@@ -114,8 +125,9 @@ class CollaborativeFrameStream:
         """Size of the Wan self-attention K/V rings for one native LR geometry."""
         config = self.wan.config
         _, patch_h, patch_w = (int(v) for v in config.patch_size)
-        # Wan sees the 4x frame through a 16x latent grid, i.e. LR / 4 per latent.
-        tokens = (padded_height // (4 * patch_h)) * (padded_width // (4 * patch_w))
+        # Wan sees the output through a 16x latent grid: LR / 4 per latent at 4x, LR / 8 at 2x.
+        latent = self.latent_stride
+        tokens = (padded_height // (latent * patch_h)) * (padded_width // (latent * patch_w))
         window = self.wan.temporal_context_frames
         window = 4 if window == -1 else window
         dim = int(config.num_attention_heads) * int(config.attention_head_dim)
@@ -135,9 +147,15 @@ class CollaborativeFrameStream:
         free, _ = torch.cuda.mem_get_info(self.device)
         free += torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
         # Headroom for Wan activations and the Flash decoder, which grows with the output.
-        headroom = 2**30 + 320 * (4 * padded_height) * (4 * padded_width)
+        headroom = 2**30 + 320 * (self.scale * padded_height) * (self.scale * padded_width)
         needed = self.wan_kv_cache_bytes(padded_height, padded_width)
         return "gpu" if needed + headroom <= free else "cpu"
+
+    def reset(self):
+        """Drop the state kept for :meth:`checkpoint`, which holds the K/V rings of the
+        last stream. ``frames()`` calls this itself; call it after a finished stream to
+        give the memory back before the next one starts."""
+        self._checkpoint_source = None
 
     def checkpoint(self) -> dict:
         """State needed to continue after the frame at the current window end.
@@ -181,9 +199,10 @@ class CollaborativeFrameStream:
             raise ValueError("The stream must start at frame 0 or at the checkpointed frame.")
         shape = tuple(first.rgb.shape)
         h, w = shape[-2:]
-        patch = self.wan.config.patch_size
-        stride = 16 * max(int(patch[1]), int(patch[2])) // 4
+        stride, scale = self.stride, self.scale
         ph, pw = h + (-h) % stride, w + (-w) % stride
+        # Before this stream measures the free memory and allocates its own rings.
+        self.reset()
         self.prepare(h, w)
         self.resolved_wan_kv_cache = self.resolve_wan_kv_cache(ph, pw)
         wan_state = self.pipeline.create_streaming_state(
@@ -204,13 +223,17 @@ class CollaborativeFrameStream:
         def keyframe(packet):
             span = DeviceSpan(self.device)
             native = prepare_lr(packet.rgb, device=self.device, dtype=self.dtype, stride=stride)
-            upsampled = F.interpolate(native, scale_factor=4, mode="bilinear", align_corners=False)
+            upsampled = native
+            if self.wan_input_scale != 1:
+                upsampled = F.interpolate(
+                    native, scale_factor=self.wan_input_scale, mode="bilinear", align_corners=False
+                )
             pending_timings.append(("wan_input", span.finish()))
             span = DeviceSpan(self.device)
             latent = self.pipeline.sample_streaming_latent_step(
                 model=self.wan,
                 lq_frame=upsampled.unsqueeze(2),
-                spatial_scale_factor=16,
+                spatial_scale_factor=self.latent_stride * self.wan_input_scale,
                 prompt_embeds=self.prompt,
                 streaming_state=wan_state,
                 generator=generator,
@@ -292,7 +315,7 @@ class CollaborativeFrameStream:
                     pending_timings.clear()
                     yield OutputFrame(
                         packet.index,
-                        prediction[..., : h * 4, : w * 4],
+                        prediction[..., : h * scale, : w * scale],
                         packet.source_time,
                         packet.arrival_time,
                         start.index,

@@ -10,15 +10,27 @@ from safetensors.torch import load_file
 from .models.flash.model import FlashVSRConditionNet
 from .models.wan.transformer import WanTransformer3DModel
 
+# Metadata ``format`` of each checkpoint to its upscaling factor. The 2x pair is
+# lightx2v/RelayVSR_X2; both files of a pair must have the same factor.
+WAN_FORMATS = {"refvsr-wan-v1": 4, "relayvsr-wan-x2-v1": 2}
+FLASH_FORMATS = {"refvsr-flash-v1": 4, "relayvsr-flash-x2-v1": 2}
+
 
 @torch.no_grad()
 def load_checkpoints(wan_path, flash_path, *, device="cuda", dtype=torch.bfloat16):
-    """Wan includes its prompt; both files include their architecture metadata."""
+    """Wan includes its prompt; both files include their architecture metadata.
+
+    The factor (4x or 2x) follows from the files; ``flash.upscale_factor`` holds it.
+    """
     with safe_open(str(wan_path), framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
-        if metadata.get("format") != "refvsr-wan-v1":
+        wan_scale = WAN_FORMATS.get(metadata.get("format"))
+        if wan_scale is None:
             raise ValueError("Expected a RelayVSR Wan safetensors checkpoint.")
         wan_config = json.loads(metadata["config"])
+        # The 2x checkpoint repeats its factor in the config; the model does not take it.
+        if wan_config.pop("upscale_factor", wan_scale) != wan_scale:
+            raise ValueError("Wan checkpoint format and upscale_factor disagree.")
         prompt_shape = handle.get_slice("prompt_embeds").get_shape()
         if (
             len(prompt_shape) != 3
@@ -29,7 +41,8 @@ def load_checkpoints(wan_path, flash_path, *, device="cuda", dtype=torch.bfloat1
             raise ValueError("Checkpoint prompt shape does not match the Wan model.")
     with safe_open(str(flash_path), framework="pt", device="cpu") as handle:
         metadata = handle.metadata() or {}
-        if metadata.get("format") != "refvsr-flash-v1":
+        flash_scale = FLASH_FORMATS.get(metadata.get("format"))
+        if flash_scale is None:
             raise ValueError("Expected a RelayVSR Flash safetensors checkpoint.")
         flash_config = json.loads(metadata["config"])
     if (
@@ -37,12 +50,17 @@ def load_checkpoints(wan_path, flash_path, *, device="cuda", dtype=torch.bfloat1
         or flash_config.get("temporal_rope_policy") != "current_relative"
     ):
         raise ValueError("Flash checkpoint must use endpoints and current_relative RoPE.")
-    if flash_config.get("upscale_factor", 4) != 4:
-        raise ValueError("The collaborative model requires 4x upscaling.")
+    if flash_config.setdefault("upscale_factor", flash_scale) != flash_scale:
+        raise ValueError("Flash checkpoint format and upscale_factor disagree.")
+    if wan_scale != flash_scale:
+        raise ValueError(
+            f"The checkpoints are for different factors: {wan_path} is {wan_scale}x, "
+            f"{flash_path} is {flash_scale}x."
+        )
     variant = flash_config.pop("variant", "S")
     with init_empty_weights():
         wan = WanTransformer3DModel.from_config(wan_config)
-        wan.lq_proj = wan.build_lq_proj()
+        wan.lq_proj = wan.build_lq_proj(wan_scale)
         wan.register_buffer("prompt_embeds", torch.empty(prompt_shape))
         flash = FlashVSRConditionNet.from_variant(variant, **flash_config)
     wan.load_state_dict(load_file(str(wan_path), device="cpu"), strict=True, assign=True)
