@@ -7,7 +7,6 @@ from pathlib import Path
 
 import torch
 
-from refvsr_inference.checkpoints import load_checkpoints
 from refvsr_inference.media import (
     VideoWriter,
     frame_count,
@@ -16,16 +15,16 @@ from refvsr_inference.media import (
     iter_frames,
     publish_video,
 )
-from refvsr_inference.models.wan.fp8 import convert_wan_fp8, release_cross_attention_kv
-from refvsr_inference.models.wan.sampling import WanVSRPipeline
 from refvsr_inference.runtime.progress import Progress
 from refvsr_inference.runtime.resume import SegmentStore, file_fingerprint
-from refvsr_inference.runtime.streaming import CollaborativeFrameStream, InputFrame
+from refvsr_inference.runtime.session import build_stream, to_uint8
+from refvsr_inference.runtime.streaming import InputFrame
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        prog="relayvsr", description="RelayVSR 4x video super-resolution"
+        prog="relayvsr",
+        description="RelayVSR video super-resolution: 4x, or 2x with the 2x checkpoints",
     )
     # The repository root: default weights and the demo input live next to the package.
     project_root = Path(__file__).resolve().parents[1]
@@ -100,44 +99,18 @@ def run(args):
     torch.set_num_threads(args.cpu_threads)
     fps = input_fps(args.input, args.fps)
     device = torch.device(args.device)
-    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
-    wan, flash = load_checkpoints(
-        args.wan_checkpoint, args.flash_checkpoint, device=device, dtype=dtype
-    )
-    sampler = WanVSRPipeline(
-        scheduler_config={"num_train_timesteps": 1000, "shift": 5.0},
-        sampling={
-            "execution_mode": "streaming",
-            "num_inference_steps": 1,
-            "timesteps": [1000],
-            "guidance_scale": 1.0,
-            "seed": args.seed,
-            "kv_cache_window_size": wan.temporal_context_frames,
-        },
-    )
-    sampler.prepare_streaming(
-        model=wan, prompt_embeds=wan.prompt_embeds, device=device, compute_dtype=dtype
-    )
-    # The text K/V are cached now, so their projections can leave the GPU.
-    release_cross_attention_kv(wan)
-    wan_weights = "bf16"
-    if args.wan_weights == "fp8":
-        if dtype != torch.bfloat16:
-            raise ValueError("--wan-weights fp8 requires --dtype bf16.")
-        if convert_wan_fp8(wan):
-            wan_weights = "fp8"
-    stream = CollaborativeFrameStream(
-        wan_model=wan,
-        flash_model=flash,
-        wan_pipeline=sampler,
-        prompt_embeds=wan.prompt_embeds,
+    stream = build_stream(
+        args.wan_checkpoint,
+        args.flash_checkpoint,
         device=device,
-        compute_dtype=dtype,
+        dtype=args.dtype,
         window_size=args.window_size,
         seed=args.seed,
-        wan_kv_cache=args.kv_cache,
-        wan_kv_cache_dtype=args.kv_cache_dtype,
+        kv_cache=args.kv_cache,
+        kv_cache_dtype=args.kv_cache_dtype,
+        wan_weights=args.wan_weights,
     )
+    wan, wan_weights = stream.wan, stream.wan_weights
     store = checkpoint = None
     if args.resume:
         # Parts must end on keyframes, which are window_size - 1 frames apart.
@@ -179,7 +152,8 @@ def run(args):
     print(
         f"Wan: {config.num_layers} layers, "
         f"dim {config.num_attention_heads * config.attention_head_dim}, "
-        f"{wan.temporal_context_frames} cached keyframes; window size {args.window_size}"
+        f"{wan.temporal_context_frames} cached keyframes; window size {args.window_size}; "
+        f"{stream.scale}x upscaling"
     )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -202,8 +176,7 @@ def run(args):
                     threads=args.encode_threads,
                 )
                 writer.__enter__()
-            rgb = result.rgb[0].add(1).mul_(127.5).clamp_(0, 255).to(torch.uint8)
-            writer.write(rgb.permute(1, 2, 0).contiguous().cpu())
+            writer.write(to_uint8(result.rgb).cpu())
             new_frames += 1
             progress.update()
             # The frame is already on the CPU, so resolving its spans cannot stall the stream.

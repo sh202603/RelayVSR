@@ -28,6 +28,8 @@ the frames are identical to upstream.
   See [Memory](#memory).
 - **Optional FP8 weights and int8 cache**: less VRAM and faster keyframes, with
   a slightly different output.
+- **2× checkpoints**: the 2× model of the LightX2V team runs with the same
+  command. See [2× upscaling](#2-upscaling).
 - **Audio pass-through**: the input audio is copied without re-encoding.
 - **Resume**: an interrupted run continues from the last finished part. See
   [Long videos](#long-videos).
@@ -52,36 +54,58 @@ https://github.com/user-attachments/assets/937a6084-3a59-4ccb-9a9c-6f0462693186
 
 ## Setup
 
-Linux or Windows 11, Python 3.11–3.13 and an NVIDIA GPU:
+Linux or Windows 11, an NVIDIA GPU, Git and [uv](https://docs.astral.sh/uv/).
+uv installs Python (3.11–3.13) itself when it is missing.
+
+### 1. Clone this fork
+
+```bash
+git clone https://github.com/sh202603/RelayVSR
+cd RelayVSR
+```
+
+The default branch, `windows-support`, is the one with this fork's changes.
+
+### 2. Install
 
 ```bash
 uv sync --locked --extra cu128
 source .venv/bin/activate        # Windows PowerShell: .venv\Scripts\Activate.ps1
 ```
 
-On Windows the Triton kernels come from `triton-windows`, which is installed
-automatically.
+This creates `.venv` with PyTorch for CUDA 12.8 and installs the `relayvsr`
+command into it. On Windows the Triton kernels come from `triton-windows`,
+which is installed automatically.
+
+### 3. Download the checkpoints
+
+Each factor has its own pair of checkpoints. Download the pair you need, or
+both, into `weights/` in the repository root:
+
+```bash
+# 4×, the original model (about 10.2 GB)
+uvx hf download kopper/RelayVSR wan.safetensors flash.safetensors --local-dir weights
+
+# 2×, trained from the 4× model by the LightX2V team (about 10.3 GB)
+uvx hf download lightx2v/RelayVSR_X2 wan_x2.safetensors flash_x2.safetensors --local-dir weights
+```
+
+| Factor | Files in `weights/` | Source |
+|---|---|---|
+| 4× | `wan.safetensors`, `flash.safetensors` | [kopper/RelayVSR](https://huggingface.co/kopper/RelayVSR) |
+| 2× | `wan_x2.safetensors`, `flash_x2.safetensors` | [lightx2v/RelayVSR_X2](https://huggingface.co/lightx2v/RelayVSR_X2) |
 
 ## Inference
 
-Download the two checkpoints from the
-[Hugging Face repository](https://huggingface.co/kopper/RelayVSR) into `weights/`:
-
-```bash
-uvx hf download kopper/RelayVSR flash.safetensors wan.safetensors --local-dir weights
-```
-
-The expected paths are `weights/wan.safetensors` and
-`weights/flash.safetensors`, resolved relative to the repository root.
-The bundled `assets/demo/input.mp4` is used when `--input` is omitted.
+Without checkpoint options the 4× pair is used, and the bundled
+`assets/demo/input.mp4` when `--input` is omitted:
 
 ```bash
 relayvsr --output output_x4.mp4
 ```
 
-`uv sync` installs the `relayvsr` command into the environment, and it works
-from any directory while the environment is active. `python inference.py` in
-the repository root is equivalent.
+The `relayvsr` command works from any directory while the environment is
+active. `python inference.py` in the repository root is equivalent.
 
 Pass `--input path/to/video.mp4` to process another video, or provide an
 ordered image directory together with `--fps`.
@@ -101,10 +125,26 @@ temporal RoPE. Override either path with `--wan-checkpoint` or `--flash-checkpoi
 - `--overwrite`: replace an existing output.
 - `--no-audio`: do not copy the input audio.
 
-Video FPS is preserved. Output resolution is exactly 4× the input. The input
+Video FPS is preserved. Output resolution is exactly 4× the input (2× with the
+2× checkpoints). The input
 audio is copied without re-encoding. Each model loads its own safetensors directly, without runtime adapter
 merging. Both files contain their model configuration; the Wan file also contains
 the prompt embeddings.
+
+### 2× upscaling
+
+The 2× model is a separate pair of checkpoints, not an option of the 4× ones.
+Pass the pair downloaded in [Setup](#3-download-the-checkpoints):
+
+```bash
+relayvsr --wan-checkpoint weights/wan_x2.safetensors \
+    --flash-checkpoint weights/flash_x2.safetensors --output output_x2.mp4
+```
+
+The factor is read from the checkpoints, so there is no option for it; the run
+prints it when it starts. The two files must be of the same factor. Every other
+option works as with the 4× model. Memory follows the output size: 1920×1080 →
+3840×2160 at 2× needs what 960×540 → 3840×2160 needs at 4×.
 
 ## Memory
 

@@ -1258,7 +1258,7 @@ class WanTransformer3DModel(
             device=device,
         )
 
-    def build_lq_proj(self):
+    def build_lq_proj(self, upscale_factor: int = 4):
         from .lq_proj import LQ4xProj
 
         return LQ4xProj(
@@ -1266,6 +1266,7 @@ class WanTransformer3DModel(
             out_dim=self.config.num_attention_heads * self.config.attention_head_dim,
             hidden_dim1=self.config.lq_proj_hidden_dim1,
             hidden_dim2=self.config.lq_proj_hidden_dim2,
+            unshuffle=4 * upscale_factor,
         )
 
     def create_streaming_state(
