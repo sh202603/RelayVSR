@@ -48,7 +48,7 @@ def frame_count(path):
     if path.suffix.lower() in IMAGE_SUFFIXES:
         return 1
     with av.open(str(path)) as container:
-        stream = container.streams.video[0]
+        stream = _video_stream(container)
         if stream.frames:
             return stream.frames
         rate = stream.average_rate
