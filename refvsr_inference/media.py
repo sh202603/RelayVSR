@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import queue
 import tempfile
+import threading
 from fractions import Fraction
 from pathlib import Path
 
@@ -101,12 +103,28 @@ def iter_frames(path, *, max_frames=None, start_frame=0):
 
 
 class VideoWriter:
+    """Encode frames on a worker thread, in the order they were written.
+
+    ``write`` only queues the frame, so the caller (the inference loop) does not
+    wait for x264. The queue is bounded: when the encoder is the slower side,
+    ``write`` blocks instead of buffering the video in memory. The encoder sees
+    the same frames in the same order as a synchronous writer, so the bitstream
+    is the same.
+
+    ``write`` does not copy: the caller must not modify the array afterwards.
+    """
+
+    QUEUE_FRAMES = 8
+
     def __init__(self, path, fps, threads=1):
         if threads < 0:
             raise ValueError("Encoder threads must be 0 (automatic) or positive.")
         self.path, self.fps, self.threads = Path(path), fps, threads
         self.container = self.stream = None
         self.frames = 0
+        self._shape = None
+        self._queue = self._worker = self._error = None
+        self._discard = False
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,28 +134,77 @@ class VideoWriter:
         self.temporary = Path(handle.name)
         handle.close()
         self.container = av.open(str(self.temporary), mode="w", format="mp4")
+        self._queue = queue.Queue(self.QUEUE_FRAMES)
+        self._worker = threading.Thread(target=self._run, name="relayvsr-encode", daemon=True)
+        self._worker.start()
         return self
 
     def write(self, frame):
         rgb = frame.numpy() if isinstance(frame, torch.Tensor) else frame
         if rgb.ndim != 3 or rgb.shape[-1] != 3 or rgb.dtype != np.uint8:
             raise ValueError("Expected uint8 RGB [H,W,3].")
-        h, w = rgb.shape[:2]
+        if self._shape is None:
+            self._shape = rgb.shape[:2]
+        if rgb.shape[:2] != self._shape:
+            raise ValueError("Output dimensions changed.")
+        self._put(rgb)
+        self.frames += 1
+
+    def _put(self, item):
+        # A timeout keeps Ctrl+C responsive on Windows, where a blocked put is not interruptible.
+        while True:
+            if self._error is not None:
+                raise self._error
+            try:
+                self._queue.put(item, timeout=0.2)
+                return
+            except queue.Full:
+                pass
+
+    def _run(self):
+        while True:
+            rgb = self._queue.get()
+            if rgb is None:
+                return
+            if self._error is not None or self._discard:
+                continue  # keep draining so that the producer never blocks
+            try:
+                self._encode(rgb)
+            except BaseException as error:  # noqa: BLE001 - handed to the caller's thread
+                self._error = error
+
+    def _encode(self, rgb):
         if self.stream is None:
+            h, w = rgb.shape[:2]
             self.stream = self.container.add_stream("libx264", rate=self.fps)
             self.stream.height, self.stream.width = h, w
             self.stream.pix_fmt = "yuv420p" if h % 2 == w % 2 == 0 else "yuv444p"
             self.stream.options = {"crf": "18", "preset": "fast"}
             self.stream.codec_context.thread_count = self.threads
-        if (h, w) != (self.stream.height, self.stream.width):
-            raise ValueError("Output dimensions changed.")
         for packet in self.stream.encode(av.VideoFrame.from_ndarray(rgb, format="rgb24")):
             self.container.mux(packet)
-        self.frames += 1
+
+    def _join(self, discard):
+        """Stop the worker; with ``discard`` the frames still queued are dropped."""
+        worker, self._worker = self._worker, None
+        if worker is None:
+            return
+        self._discard = discard
+        while worker.is_alive():
+            try:
+                self._queue.put(None, timeout=0.2)
+                break
+            except queue.Full:
+                pass
+        while worker.is_alive():
+            worker.join(0.2)
 
     def __exit__(self, exc_type, exc, traceback):
         try:
+            self._join(discard=exc_type is not None)
             if exc_type is None:
+                if self._error is not None:
+                    raise self._error
                 if self.stream is None:
                     raise ValueError("Cannot publish an empty video.")
                 for packet in self.stream.encode():
@@ -146,6 +213,7 @@ class VideoWriter:
                 self.container = None
                 self.temporary.replace(self.path)
         finally:
+            self._join(discard=True)
             if self.container is not None:
                 self.container.close()
             self.temporary.unlink(missing_ok=True)

@@ -176,6 +176,7 @@ def run(args):
                     threads=args.encode_threads,
                 )
                 writer.__enter__()
+            # Queued for the encoder thread; the stream does not wait for x264.
             writer.write(to_uint8(result.rgb).cpu())
             new_frames += 1
             progress.update()

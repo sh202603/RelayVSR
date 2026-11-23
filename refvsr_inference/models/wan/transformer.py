@@ -16,7 +16,7 @@
 import math
 import warnings
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -51,6 +51,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention as _flex_attention,
 )
 
+from refvsr_inference.models.wan.rotary import apply_wan_rotary as _apply_wan_rotary
 from refvsr_inference.models.wan.spatial_attention import SpatialAttentionSpec, spatial_attention
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -67,17 +68,100 @@ class WanKVScratch:
     """
 
     key_value: tuple[torch.Tensor, torch.Tensor] | None = None
+    # State of exchange(): a second window, the stream of the host transfers, the layer
+    # whose window is being loaded, the last event of that stream, and tensors it reads.
+    _other: tuple[torch.Tensor, torch.Tensor] | None = None
+    _side: torch.cuda.Stream | None = None
+    _pending: tuple | None = None
+    _settled: torch.cuda.Event | None = None
+    _retained: list = field(default_factory=list)
 
-    def get(self, shape, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        current = self.key_value
+    def get(
+        self, shape, like: torch.Tensor, index: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        current = self._other if index else self.key_value
         if (
             current is None
             or current[0].shape != shape
             or current[0].device != like.device
             or current[0].dtype != like.dtype
         ):
-            self.key_value = current = like.new_empty(shape), like.new_empty(shape)
+            current = like.new_empty(shape), like.new_empty(shape)
+            if index:
+                self._other = current
+            else:
+                self.key_value = current
         return current
+
+    def exchange(
+        self,
+        cache: "WanSelfAttentionKVCache",
+        key: torch.Tensor,
+        value: torch.Tensor,
+        frame_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Window of a host ring for one frame, with the host transfers off the main stream.
+
+        The main stream only does GPU work. A side stream writes the new frame back to
+        the host and loads the next host layer's earlier frames into the other window
+        while this layer computes, so the transfers overlap the computation instead of
+        preceding it. The windows hold the same values as with in-line copies.
+
+        Order between the streams:
+
+        * the main stream waits for the side stream before it touches a window or
+          lets go of a tensor the side stream reads;
+        * the side stream waits for ``point``: the new frame exists, and the main
+          stream is past the attention that read the other window.
+        """
+        b, tokens, heads, dim = key.shape
+        shape = (b, cache.window_size * tokens, heads, dim)
+        start = (frame_index % cache.window_size) * tokens
+        stop = start + tokens
+        valid = min(frame_index + 1, cache.window_size) * tokens
+        earlier = [(first, last) for first, last in ((0, start), (stop, valid)) if first < last]
+        main = torch.cuda.current_stream(key.device)
+        if self._side is None:
+            self._side = torch.cuda.Stream(key.device)
+        side = self._side
+        pending, self._pending = self._pending, None
+        if self._settled is not None:
+            main.wait_event(self._settled)
+            # Whatever the main stream allocates from here on runs after those transfers.
+            self._retained.clear()
+        if pending is not None and pending[:2] == (id(cache), frame_index):
+            index = pending[2]
+            window = self.get(shape, key, index)
+        else:
+            index = 0
+            window = self.get(shape, key, index)
+            for (data, _), target in zip(cache._storage, window):
+                for first, last in earlier:
+                    target[:, first:last].copy_(data[:, first:last], non_blocking=True)
+        for target, new in zip(window, (key, value)):
+            target[:, start:stop].copy_(new)
+        point = main.record_event()
+        following = cache.next_host
+        if following is not None and (
+            not earlier
+            or following._storage is None
+            or following.next_frame != frame_index
+            or following.tokens_per_frame != tokens
+        ):
+            following = None
+        other = self.get(shape, key, 1 - index) if following is not None else None
+        with torch.cuda.stream(side):
+            side.wait_event(point)
+            for (data, _), new in zip(cache._storage, (key, value)):
+                data[:, start:stop].copy_(new, non_blocking=True)
+            if following is not None:
+                for (data, _), target in zip(following._storage, other):
+                    for first, last in earlier:
+                        target[:, first:last].copy_(data[:, first:last], non_blocking=True)
+                self._pending = (id(following), frame_index, 1 - index)
+            self._settled = side.record_event()
+        self._retained += (key, value)
+        return window[0][:, :valid], window[1][:, :valid]
 
 
 def _empty_store(shape, dtype, device, on_host: bool) -> torch.Tensor:
@@ -111,6 +195,8 @@ class WanSelfAttentionKVCache:
     scratch: WanKVScratch | None = None
     on_host: bool = False
     quantized: bool = False
+    # The host layer that runs after this one; its window is loaded ahead (WanKVScratch).
+    next_host: "WanSelfAttentionKVCache | None" = field(default=None, repr=False, compare=False)
     _storage: tuple | None = None
     _signature: tuple | None = None
 
@@ -167,6 +253,8 @@ class WanSelfAttentionKVCache:
         if self.tokens_per_frame != tokens or self._signature != signature:
             raise ValueError("Streaming KV cache shape, device and dtype must remain constant.")
         self.next_frame += 1
+        if self.on_host and not self.quantized and key.is_cuda:
+            return self.scratch.exchange(self, key.detach(), value.detach(), frame_index)
         window = self.scratch.get(shape, key)
         for (data, scale), target, new in zip(self._storage, window, (key, value)):
             new = new.detach()
@@ -291,16 +379,6 @@ class WanStreamingState:
         for cache, block in zip(self.block_caches, payload["blocks"]):
             cache.restore(block, device=device, dtype=dtype)
         self.frame_index = int(payload["frame_index"])
-
-
-def _apply_wan_rotary(hidden_states, rotary_emb):
-    freqs_cos, freqs_sin = rotary_emb
-    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-    cos, sin = freqs_cos[..., 0::2], freqs_sin[..., 1::2]
-    out = torch.empty_like(hidden_states)
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
-    return out
 
 
 def _get_qkv_projections(
@@ -1308,13 +1386,17 @@ class WanTransformer3DModel(
             )
         on_host, quantized = kv_cache_device == "cpu", kv_cache_dtype == "int8"
         scratch = WanKVScratch() if on_host or quantized else None
+        block_caches = [
+            WanSelfAttentionKVCache(
+                window_size=window, scratch=scratch, on_host=on_host, quantized=quantized
+            )
+            for _ in self.blocks
+        ]
+        hosted = [cache for cache in block_caches if cache.on_host and not cache.quantized]
+        for cache, following in zip(hosted, hosted[1:]):
+            cache.next_host = following
         return WanStreamingState(
-            block_caches=[
-                WanSelfAttentionKVCache(
-                    window_size=window, scratch=scratch, on_host=on_host, quantized=quantized
-                )
-                for _ in self.blocks
-            ],
+            block_caches=block_caches,
             conditioning_cache=conditioning_cache,
         )
 
@@ -1545,16 +1627,15 @@ class WanTransformer3DModel(
                 encoder_hidden_states,
             )
         else:
-            if timestep.ndim == 2:
-                token_count = timestep.shape[1]
-            elif timestep.ndim == 1:
-                token_count = 1
-            else:
+            if timestep.ndim not in (1, 2):
                 raise ValueError("Streaming timestep must have shape [batch] or [batch, tokens].")
+            # Every token of a streaming frame shares the cached timestep, so the token
+            # axis stays 1 and broadcasts in the blocks. Expanding it would make each
+            # block materialize an fp32 [tokens, 6, dim] modulation with the same values.
             temb, timestep_proj, encoder_hidden_states = self._expand_streaming_conditioning(
                 streaming_state=streaming_state,
                 batch_size=batch_size,
-                token_count=token_count,
+                token_count=1,
             )
 
         # 4. Transformer blocks
