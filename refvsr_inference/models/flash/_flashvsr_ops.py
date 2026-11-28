@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -103,6 +105,22 @@ class _RotaryEmbedding3D(nn.Module):
         cosines: torch.Tensor,
         sines: torch.Tensor,
     ) -> torch.Tensor:
+        """Rotate [..., tokens, D] by per-token tables [tokens, D].
+
+        On CUDA a fused kernel computes the values of :meth:`apply_eager` in one pass.
+        """
+        if _fused_rotary_usable(tensor, cosines, sines):
+            from ._rotary_triton import triton_rotary
+
+            return triton_rotary(tensor, cosines, sines)
+        return _RotaryEmbedding3D.apply_eager(tensor, cosines, sines)
+
+    @staticmethod
+    def apply_eager(
+        tensor: torch.Tensor,
+        cosines: torch.Tensor,
+        sines: torch.Tensor,
+    ) -> torch.Tensor:
         even = tensor[..., 0::2]
         odd = tensor[..., 1::2]
         rotated = torch.empty_like(tensor)
@@ -111,6 +129,64 @@ class _RotaryEmbedding3D(nn.Module):
         rotated[..., 0::2] = even * cosines[..., 0::2] - odd * sines[..., 0::2]
         rotated[..., 1::2] = even * sines[..., 1::2] + odd * cosines[..., 1::2]
         return rotated
+
+
+_fused_rotary_checked: dict[tuple, bool] = {}
+
+
+def _fused_rotary_usable(tensor: torch.Tensor, cosines: torch.Tensor, sines: torch.Tensor) -> bool:
+    """Whether the fused kernel may replace the eager form for this call."""
+    dim = tensor.shape[-1] if tensor.ndim == 4 else 0
+    if not (
+        tensor.is_cuda
+        and tensor.dtype in (torch.bfloat16, torch.float16)
+        and not tensor.requires_grad
+        and 0 < tensor.numel() < 2**31
+        # The kernel indexes the channels with a power-of-two range.
+        and dim >= 2
+        and dim & (dim - 1) == 0
+        and all(
+            table.dtype == tensor.dtype
+            and table.device == tensor.device
+            and tuple(table.shape) == tuple(tensor.shape[2:])
+            and not table.requires_grad
+            for table in (cosines, sines)
+        )
+    ):
+        return False
+    key = (tensor.device, tensor.dtype, dim)
+    usable = _fused_rotary_checked.get(key)
+    if usable is None:
+        usable = _fused_rotary_checked[key] = _fused_rotary_matches_eager(*key)
+    return usable
+
+
+def _fused_rotary_matches_eager(device: torch.device, dtype: torch.dtype, dim: int) -> bool:
+    """Compare the fused kernel with the eager form once per device, dtype and width.
+
+    The rounding of the kernel depends on how it is compiled, and the fused pass is only
+    an optimization: where it is not bit-identical, the eager form stays in use.
+    """
+    from ._rotary_triton import triton_rotary
+
+    generator = torch.Generator().manual_seed(0)
+    tokens, heads = 4096, 4
+    # Strided like a projected query: [B,tokens,heads,D] viewed as [B,heads,tokens,D].
+    sample = torch.randn(1, tokens, heads, dim, generator=generator).mul_(4)
+    sample = sample.to(device=device, dtype=dtype).transpose(1, 2)
+    angles = torch.rand(tokens, dim, generator=generator).mul_(2 * math.pi).to(device)
+    cosines, sines = angles.cos().to(dtype), angles.sin().to(dtype)
+    matches = torch.equal(
+        triton_rotary(sample, cosines, sines),
+        _RotaryEmbedding3D.apply_eager(sample, cosines, sines),
+    )
+    if not matches:
+        warnings.warn(
+            "The fused Flash RoPE kernel does not reproduce the eager form on this "
+            "platform; using the eager form.",
+            stacklevel=2,
+        )
+    return matches
 
 
 class _SwiGLU(nn.Module):
